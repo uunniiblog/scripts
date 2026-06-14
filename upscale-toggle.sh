@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
+# Example usage: ~/scripts/upscale-toggle.sh 白詰草話 600p 19
+
 PROCESS_NAME="upscale"
-#UPSCALE_MODEL="-m fast"
 
 DEFAULT_PROFILE="--profile 720p"
 #DEFAULT_PROFILE="--profile 1080p"
 #DEFAULT_PROFILE="--profile 600p"
 #DEFAULT_PROFILE="--profile window"
 
+# Uncomment to use specific monitor
 #MONITOR="--monitor HDMI-A-2"
-
-#WINDOW_MODE="--overlay-mode windowed --output-geometry x1440"
 
 SCREENSHOT_DIR="--screenshot-dir ~/Pictures/Screenshots/VNs --screenshot-filename {title}/Screenshot_{timestamp:%Y%m%d_%H%M%S}_{model}.png"
 
@@ -32,13 +32,10 @@ else
     CROP_CMD=""
 fi
 
-#--double-upscale
 BASE_CMD="mangohud $PROCESS_NAME $PROFILE --debug $LOG_FILE $MONITOR --target-delay 1 $SCREENSHOT_DIR $CROP_CMD"
 
 if [ -n "$WINDOW_TITLE" ]; then
     UPSCALE_CMD="$BASE_CMD -t $WINDOW_TITLE"
-    # Wait for game to open
-    # sleep 5
 else
     UPSCALE_CMD="$BASE_CMD"
 fi
