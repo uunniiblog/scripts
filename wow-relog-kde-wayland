@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Relog a native Wayland WoW window through KWin and ydotool."""
+
+import argparse
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import random
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+UNIT = "wow-relog.service"
+TITLE = "^World of Warcraft$"
+CLASS = "wowb.exe"
+ENTER = ("28:1", "28:0")
+NUMPAD_DIVIDE = ("98:1", "98:0")
+COMMAND_KEYS = (
+    ("46:1", "46:0"),  # c
+    ("30:1", "30:0"),  # a
+    ("50:1", "50:0"),  # m
+    ("25:1", "25:0"),  # p
+)
+KEY_PRESS_MS = 80
+KEY_GAP_SECONDS = 0.18
+FOCUS_SETTLE_SECONDS = 0.65
+STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "wow-relog-status.json"
+LOCK_FILE = STATE_FILE.with_suffix(".lock")
+
+
+def command(*args, check=True):
+    return subprocess.run(args, text=True, capture_output=True, check=check)
+
+
+def window_id():
+    result = command("kdotool", "search", "--name", TITLE, "getwindowid", "%@", check=False)
+    for candidate in result.stdout.splitlines():
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        info = command("kdotool", "getwindowclassname", candidate, check=False)
+        if info.returncode == 0 and info.stdout.strip().lower() == CLASS:
+            return candidate
+    return None
+
+
+def active_id():
+    result = command("kdotool", "getactivewindow", "getwindowid", check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def send_to_game(stage):
+    target = window_id()
+    if target is None:
+        print("WoW window not found; waiting to retry", flush=True)
+        return False
+
+    previous = active_id()
+    try:
+        if previous != target:
+            command("kdotool", "windowactivate", target)
+            for _ in range(20):
+                if active_id() == target:
+                    break
+                time.sleep(0.1)
+            else:
+                print("Could not focus WoW; no keys sent", flush=True)
+                return False
+        time.sleep(FOCUS_SETTLE_SECONDS)
+
+        def key(*codes):
+            if active_id() != target:
+                raise RuntimeError("WoW lost focus; stopped sending keys")
+            command("ydotool", "key", "--key-delay", str(KEY_PRESS_MS), *codes)
+            time.sleep(KEY_GAP_SECONDS)
+
+        if stage == "camp":
+            key(*ENTER)
+            key(*NUMPAD_DIVIDE)
+            for codes in COMMAND_KEYS:
+                key(*codes)
+            key(*ENTER)
+            print("Sent /camp", flush=True)
+        else:
+            key(*ENTER)
+            print("Sent Enter at character selection", flush=True)
+        time.sleep(0.35)
+        return True
+    except (subprocess.CalledProcessError, RuntimeError) as exc:
+        print(f"Input failed: {exc}", file=sys.stderr, flush=True)
+        return False
+    finally:
+        if previous and previous != target and active_id() == target:
+            command("kdotool", "windowactivate", previous, check=False)
+
+
+def save_state(step, deadline=None):
+    state = {"pid": os.getpid(), "step": step, "deadline": deadline}
+    fd, temporary = tempfile.mkstemp(prefix="wow-relog-", dir=STATE_FILE.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(state, output)
+        os.replace(temporary, STATE_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def wait_for(step, seconds):
+    deadline = time.monotonic() + seconds
+    save_state(step, deadline)
+    time.sleep(seconds)
+
+
+def acquire_lock():
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def running_pid():
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.lseek(fd, 0, os.SEEK_SET)
+            value = os.read(fd, 32).decode().strip()
+            return int(value) if value.isdigit() else None
+        return None
+    finally:
+        os.close(fd)
+
+
+def run(game_min, game_max, select_min, select_max):
+    lock = acquire_lock()
+    if lock is None:
+        print("WoW relog is already running", file=sys.stderr)
+        return 1
+    try:
+        save_state("starting")
+        if command("ydotool", "debug", check=False).returncode != 0:
+            print("ydotoold is unavailable. Run: systemctl --user enable --now ydotool.service", file=sys.stderr)
+            return 1
+
+        print(
+            f"In-game wait {game_min}-{game_max}s; character selection wait {select_min}-{select_max}s",
+            flush=True,
+        )
+        stage = "camp"
+        while True:
+            save_state("sending_camp" if stage == "camp" else "sending_enter")
+            if not send_to_game(stage):
+                wait_for("retry_camp" if stage == "camp" else "retry_enter", 5)
+                continue
+            if stage == "camp":
+                stage = "enter"
+                wait = random.randint(select_min, select_max)
+                print(f"Waiting {wait}s at character selection", flush=True)
+                wait_for("waiting_selection", wait)
+            else:
+                stage = "camp"
+                wait = random.randint(game_min, game_max)
+                print(f"Waiting {wait}s in game", flush=True)
+                wait_for("waiting_game", wait)
+    finally:
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            if state.get("pid") == os.getpid():
+                STATE_FILE.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
+        os.close(lock)
+
+
+def service_active():
+    return command("systemctl", "--user", "is-active", "--quiet", UNIT, check=False).returncode == 0
+
+
+def status():
+    pid = running_pid()
+    if pid is None:
+        print("stopped")
+        return
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        print("running: starting")
+        return
+    if state.get("pid") != pid:
+        print("running: starting")
+        return
+
+    descriptions = {
+        "sending_camp": "in game, sending /camp",
+        "sending_enter": "at character selection, sending Enter",
+        "waiting_selection": "at character selection, next command: Enter",
+        "waiting_game": "in game, next command: /camp",
+        "retry_camp": "waiting for WoW, retrying /camp",
+        "retry_enter": "waiting for WoW, retrying Enter",
+    }
+    description = descriptions.get(state.get("step"), "starting")
+    deadline = state.get("deadline")
+    if isinstance(deadline, (int, float)):
+        remaining = max(0, math.ceil(deadline - time.monotonic()))
+        hours, leftover = divmod(remaining, 3600)
+        minutes, seconds = divmod(leftover, 60)
+        countdown = f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
+        print(f"running: {description} in {countdown}")
+    else:
+        print(f"running: {description}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("run", "start", "stop", "toggle", "status"),
+                        help="start stays in this terminal; toggle starts in the background")
+    parser.add_argument("--game-min", type=int, help="minimum seconds in game (default: 180)")
+    parser.add_argument("--game-max", type=int, help="maximum seconds in game (default: 480)")
+    parser.add_argument("--select-min", type=int, help="minimum seconds at character selection (default: 60)")
+    parser.add_argument("--select-max", type=int, help="maximum seconds at character selection (default: 240)")
+    parser.add_argument("--minutes", type=float, help="legacy: fixed in-game wait in minutes")
+    parser.add_argument("--select-wait", type=float, help="legacy: fixed character selection wait in seconds")
+    args = parser.parse_args()
+    if args.minutes is not None and (args.game_min is not None or args.game_max is not None):
+        parser.error("--minutes cannot be combined with --game-min or --game-max")
+    if args.select_wait is not None and (args.select_min is not None or args.select_max is not None):
+        parser.error("--select-wait cannot be combined with --select-min or --select-max")
+    game_min = args.game_min if args.game_min is not None else 180
+    game_max = args.game_max if args.game_max is not None else 480
+    select_min = args.select_min if args.select_min is not None else 60
+    select_max = args.select_max if args.select_max is not None else 240
+    if args.minutes is not None:
+        game_min = game_max = round(args.minutes * 60)
+    if args.select_wait is not None:
+        select_min = select_max = round(args.select_wait)
+    if min(game_min, game_max, select_min, select_max) <= 0:
+        parser.error("wait bounds must be positive seconds")
+    if game_min > game_max or select_min > select_max:
+        parser.error("each minimum must be less than or equal to its maximum")
+
+    if args.action in ("run", "start"):
+        return run(game_min, game_max, select_min, select_max)
+    if args.action == "status":
+        status()
+        return 0
+    pid = running_pid()
+    if args.action == "stop" or (args.action == "toggle" and pid is not None):
+        if pid is None:
+            print("WoW relog is already stopped")
+            return 0
+        if service_active():
+            result = command("systemctl", "--user", "stop", UNIT, check=False)
+            if result.returncode:
+                print(result.stderr.strip(), file=sys.stderr)
+                return result.returncode
+        else:
+            os.kill(pid, signal.SIGINT)
+        print("WoW relog stopped")
+        return 0
+    if pid is not None:
+        print("WoW relog is already running")
+        return 0
+    result = command(
+        "systemd-run", "--user", "--unit=wow-relog", "--collect",
+        sys.executable, __file__, "run", "--game-min", str(game_min),
+        "--game-max", str(game_max), "--select-min", str(select_min),
+        "--select-max", str(select_max), check=False,
+    )
+    if result.returncode:
+        print(result.stderr.strip(), file=sys.stderr)
+    else:
+        print(f"WoW relog started (game {game_min}-{game_max}s, character selection {select_min}-{select_max}s)")
+    return result.returncode
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("Stopped")
